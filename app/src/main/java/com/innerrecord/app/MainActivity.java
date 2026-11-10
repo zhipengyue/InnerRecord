@@ -14,6 +14,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.net.Uri;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -31,6 +33,7 @@ import java.util.Comparator;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
+    public static final String ACTION_FLOATING_START = "com.innerrecord.app.FLOATING_START";
     private static final int REQUEST_AUDIO = 100;
     private static final int REQUEST_PROJECTION = 101;
     private static final int REQUEST_SAVE_AS = 102;
@@ -49,6 +52,8 @@ public class MainActivity extends Activity {
     private String lastState = "idle";
     private boolean wasRecording;
     private boolean waitingProjection;
+    private boolean pendingOverlayPermission;
+    private boolean startedFromOverlay;
     private long elapsedBeforePause;
     private long resumedAt;
     private MediaPlayer player;
@@ -69,6 +74,39 @@ public class MainActivity extends Activity {
         setContentView(root);
         render();
         handler.post(tick);
+        if (ACTION_FLOATING_START.equals(getIntent().getAction())) {
+            startedFromOverlay = true;
+            handler.post(this::startCapture);
+        } else if (getPreferences(MODE_PRIVATE).getBoolean("overlay_enabled", false)
+                && Settings.canDrawOverlays(this)) {
+            startForegroundService(new Intent(this, FloatingControlService.class));
+        }
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (ACTION_FLOATING_START.equals(intent.getAction())) {
+            startedFromOverlay = true;
+            page = "record";
+            render();
+            if ("idle".equals(RecorderService.state)) startCapture();
+        }
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (pendingOverlayPermission) {
+            pendingOverlayPermission = false;
+            if (Settings.canDrawOverlays(this)) {
+                getPreferences(MODE_PRIVATE).edit().putBoolean("overlay_enabled", true).apply();
+                startForegroundService(new Intent(this, FloatingControlService.class));
+                toast("悬浮按钮已开启");
+            } else {
+                toast("未获得悬浮窗权限");
+            }
+            render();
+        }
     }
 
     @Override protected void onDestroy() {
@@ -177,8 +215,10 @@ public class MainActivity extends Activity {
     }
 
     private void renderSettings() {
+        ScrollView scroll = new ScrollView(this);
+        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout body = column();
-        root.addView(body, new LinearLayout.LayoutParams(-1, 0, 1));
+        scroll.addView(body);
         body.addView(text("音频来源", 20, TEXT, true), wide(dp(48)));
         body.addView(button(("internal".equals(mode) ? "✓  " : "") + "内录 · 其他应用播放", false,
                 v -> { mode = "internal"; saveSettings(); render(); }), wide(dp(62)));
@@ -192,6 +232,16 @@ public class MainActivity extends Activity {
                 v -> { format = "wav"; saveSettings(); render(); }), wide(dp(62)));
         body.addView(button(("mp3".equals(format) ? "✓  " : "") + "MP3 · 压缩音频", false,
                 v -> { format = "mp3"; saveSettings(); render(); }), wide(dp(62)));
+        TextView floatingLabel = text("悬浮录音", 20, TEXT, true);
+        LinearLayout.LayoutParams floatingGap = wide(dp(58));
+        floatingGap.topMargin = dp(24);
+        body.addView(floatingLabel, floatingGap);
+        boolean floatingEnabled = getPreferences(MODE_PRIVATE).getBoolean("overlay_enabled", false)
+                && Settings.canDrawOverlays(this);
+        body.addView(button(floatingEnabled ? "✓  悬浮按钮已开启 · 点击关闭" : "开启悬浮按钮",
+                false, v -> toggleFloatingControl()), wide(dp(62)));
+        body.addView(text("在其他应用上层快速开始、暂停、继续或停止录音。首次开启需要授予悬浮窗权限。",
+                14, MUTED, false), wide(-2));
         TextView note = text("录音保存在应用私有目录。内录取决于播放应用的采集策略；普通应用不能保证录到通话对方的声音。", 14, MUTED, false);
         LinearLayout.LayoutParams noteParams = wide(-2);
         noteParams.topMargin = dp(30);
@@ -307,6 +357,32 @@ public class MainActivity extends Activity {
             Intent intent = new Intent(this, RecorderService.class).setAction(RecorderService.START)
                     .putExtra("mode", "call").putExtra("format", format);
             startForegroundService(intent);
+            returnToOtherApp();
+        }
+    }
+
+    private void toggleFloatingControl() {
+        boolean enabled = getPreferences(MODE_PRIVATE).getBoolean("overlay_enabled", false);
+        if (enabled) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("overlay_enabled", false).apply();
+            stopService(new Intent(this, FloatingControlService.class));
+            render();
+        } else if (Settings.canDrawOverlays(this)) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("overlay_enabled", true).apply();
+            startForegroundService(new Intent(this, FloatingControlService.class));
+            render();
+        } else {
+            pendingOverlayPermission = true;
+            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        }
+    }
+
+    private void returnToOtherApp() {
+        if (startedFromOverlay) {
+            startedFromOverlay = false;
+            moveTaskToBack(true);
         }
     }
 
@@ -314,7 +390,7 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grants);
         if (requestCode == REQUEST_AUDIO) {
             if (grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED) startCapture();
-            else showMessage("需要录音权限才能开始录制。");
+            else { startedFromOverlay = false; showMessage("需要录音权限才能开始录制。"); }
         }
     }
 
@@ -323,6 +399,7 @@ public class MainActivity extends Activity {
         if (requestCode == REQUEST_PROJECTION) {
             waitingProjection = false;
             if (resultCode != RESULT_OK || data == null) {
+                startedFromOverlay = false;
                 toast("已取消系统内录授权"); render(); return;
             }
             Intent intent = new Intent(this, RecorderService.class).setAction(RecorderService.START)
@@ -330,6 +407,7 @@ public class MainActivity extends Activity {
                     .putExtra("resultCode", resultCode).putExtra("projectionData", data);
             startForegroundService(intent);
             render();
+            returnToOtherApp();
         } else if (requestCode == REQUEST_SAVE_AS) {
             File source = pendingSave;
             pendingSave = null;
